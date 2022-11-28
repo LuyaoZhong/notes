@@ -28,6 +28,8 @@ cp -rfp inventory/sample inventory/testbed
 declare -a IPS=($CTRL $WORKER)
 # echo ${IPS[@]}
 CONFIG_FILE=inventory/testbed/hosts.yaml python3 contrib/inventory_builder/inventory.py ${IPS[@]}
+# modify inventory/testbed/hosts.yaml and inventory/testbed/group_vars/* to change setting
+# e.g. change CNI by modifying inventory/testbed/group_vars/k8s_cluster/k8s-cluster.yml
 ansible-playbook -i inventory/testbed/hosts.yaml  --become --become-user=root cluster.yml
 
 # Set up the access config
