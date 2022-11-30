@@ -1,2 +1,24 @@
+# install docker
+# https://docs.docker.com/engine/install/ubuntu/#install-using-the-repository
+
+# install golang
+# https://go.dev/doc/install
+
+# install kind
+# https://kind.sigs.k8s.io/docs/user/quick-start/#installing-with-go-get--go-install
+go install sigs.k8s.io/kind@v0.17.0
+
+# install kubectl
+# https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+# deploy kind cluster
 export CLUSTER1=cluster1
 ./deploy-multi.sh 1 cluster1
+kubectl cluster-info --context kind-kind1
+kubectl get nodes
+
+# deploy ambient
+istioctl install --set profile=ambient
+kubectl label namespace default istio.io/dataplane-mode=ambient
