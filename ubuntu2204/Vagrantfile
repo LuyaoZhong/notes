@@ -1,4 +1,5 @@
 # https://developer.hashicorp.com/vagrant/docs/vagrantfile
+# https://vagrant-libvirt.github.io/vagrant-libvirt/
 
 ENV['VAGRANT_DEFAULT_PROVIDER'] = 'libvirt'
 
@@ -15,7 +16,7 @@ Vagrant.configure("2") do |config|
     controller.vm.hostname = "master-ubuntu2204"
     controller.ssh.insert_key = false
     controller.vm.box_check_update = false
-    controller.vm.network :private_network, type: "dhcp"
+    # controller.vm.network :private_network, ip: "192.168.121.2"
     # config.vm.provision :shell, :privileged => true, :path => "setup.sh"
     controller.vm.provision "shell",inline: <<-SHELL
         sudo mkdir /root/.ssh/
