@@ -1,8 +1,17 @@
 # install docker
 # https://docs.docker.com/engine/install/ubuntu/#install-using-the-repository
+sudo snap install docker
+sudo addgroup --system docker
+sudo adduser $USER docker
+newgrp docker
+sudo snap disable docker
+sudo snap enable docker
 
 # install golang
 # https://go.dev/doc/install
+# wget https://go.dev/dl/go1.19.5.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.19.5.linux-amd64.tar.gz
+export PATH=$PATH:/usr/local/go/bin:/home/$USER/go/bin
 
 # install kind
 # https://kind.sigs.k8s.io/docs/user/quick-start/#installing-with-go-get--go-install
@@ -16,9 +25,9 @@ sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 # deploy kind cluster
 export CLUSTER1=cluster1
 ./deploy-multi.sh 1 cluster1
-kubectl cluster-info --context kind-kind1
+kubectl cluster-info --context cluster1
 kubectl get nodes
 
 # deploy ambient
-istioctl install --set profile=ambient
+./istioctl install --set profile=ambient
 kubectl label namespace default istio.io/dataplane-mode=ambient
