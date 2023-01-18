@@ -1,0 +1,43 @@
+# https://developer.hashicorp.com/vagrant/docs/vagrantfile
+
+ENV['VAGRANT_DEFAULT_PROVIDER'] = 'libvirt'
+
+Vagrant.configure("2") do |config|
+  config.vm.provider :libvirt do |libvirt|
+    libvirt.cpus = 8
+    libvirt.memory = 8096
+  end
+
+  config.vm.define "controller" do |controller|
+    controller.ssh.insert_key = false
+    controller.vm.synced_folder ".", "/vagrant", id: "v-root", mount_options: ["rw", "tcp", "nolock", "noacl", "async"], type: "nfs", nfs_udp: false
+    controller.vm.box = 'generic/ubuntu2004'
+    controller.vm.hostname = "master-ubuntu2004"
+    controller.ssh.insert_key = false
+    controller.vm.box_check_update = false
+    controller.vm.network :private_network, type: "dhcp"
+    # config.vm.provision :shell, :privileged => true, :path => "setup.sh"
+    controller.vm.provision "shell",inline: <<-SHELL
+        sudo mkdir /root/.ssh/
+        sudo ssh-keygen -t rsa -P "" -f /root/.ssh/id_rsa
+        sudo cat /root/.ssh/id_rsa.pub > /root/.ssh/authorized_keys
+        sudo cat /vagrant/ssh_key >> /root/.ssh/authorized_keys
+
+        sudo systemctl disable systemd-resolved
+        sudo systemctl stop systemd-resolved
+        rm -rf /etc/resolv.conf
+        echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+        sudo rm /etc/localtime && sudo ln -s /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+        sudo echo '127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4 master' >/etc/hosts
+        sudo echo '::1         localhost localhost.localdomain localhost6 localhost6.localdomain6 master' >>/etc/hosts
+        date -s "$(date -d "$(curl -sI google.com| grep -i '^date:'|cut -d' ' -f2-)" | xargs -I {} date --date='{}' "+%Y-%m-%d %H:%M:%S")"
+        apt update
+        apt install nfs-common portmap -y
+        ip a 
+    SHELL
+  end
+  # config.vm.define "node1" do |node1|
+  # end
+  # config.vm.define "node2" do |node2|
+  # end
+end

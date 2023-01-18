@@ -10,3 +10,5 @@ sudo apt-get update && \
 # Install the latest release of vagrant-libvirt
 vagrant plugin install vagrant-libvirt
 
+# Check unix_sock_group in /etc/libvirt/libvirtd.conf
+# sudo usermod -a -G libvirt $USER
