@@ -1,0 +1,257 @@
+From 9354122f665fb8737d14177fa1032e39ed4eaaf6 Mon Sep 17 00:00:00 2001
+From: Luyao Zhong <luyao.zhong@intel.com>
+Date: Thu, 9 Jul 2020 03:43:37 -0400
+Subject: [PATCH 1/3] Memory tiering support
+
+Hosts with memtier enabled can only accept instances with memtier required,
+including pure PMEM request and mixed memory.
+
+flavor extra spec required:
+trait:CUSTOM_MEMTIER='required'
+hw:memtier.toptier_limit : '0' means it's a pure PMEM request
+
+1. Resource report and track
+   a) Merge PMEM size into DRAM size, all memory will be treated as DRAM.
+   b) No seperate PMEM usage tracking, it relies on numa-placement feature
+2. Scheduling
+   a) flavor extra spec trait:CUSTOM_MEMTIER='required' is config interface to
+   declare that the instance needs on memtier host, otherwise it will be tagged
+   trait:CUSTOM_MEMTIER='forbidden' implicitly.
+   b) for pure PMEM request of non-numa specified instance, one single numa
+   node will be created implicitly.
+3. Libvirt driver
+   a) Cache the memtier affinities, which means top & second tier node pair.
+   b) if it requires pure PMEM or numa, use "numatune" to bind the memory.
+   c) "hw:memtier.toptier_limit" DRAM usage limit , use "memtune" to set this
+   limit.
+---
+ nova/privsep/libvirt.py       | 10 +++++++++
+ nova/scheduler/utils.py       | 19 +++++++++++++++-
+ nova/virt/hardware.py         | 19 +++++++++++++++-
+ nova/virt/libvirt/config.py   |  5 +++++
+ nova/virt/libvirt/designer.py |  4 ++--
+ nova/virt/libvirt/driver.py   | 41 +++++++++++++++++++++++++++++++++--
+ 6 files changed, 92 insertions(+), 6 deletions(-)
+
+diff --git a/nova/privsep/libvirt.py b/nova/privsep/libvirt.py
+index b7247c5cd0..119b64364f 100644
+--- a/nova/privsep/libvirt.py
++++ b/nova/privsep/libvirt.py
+@@ -252,3 +252,13 @@ def get_pmem_namespaces():
+ def cleanup_vpmem(devpath):
+     daxio_cmd = ['daxio', '-z', '-o', '%s' % devpath]
+     processutils.execute(*daxio_cmd)
++
++
++@nova.privsep.sys_admin_pctxt.entrypoint
++def get_second_tier_memnode(toptier):
++    fpath = '/sys/devices/system/node/node{0}/migration_path'
++    fpath = fpath.format(toptier)
++    if not os.path.exists(fpath):
++        return -1
++    with open(fpath, 'r') as f:
++        return int(f.read())
+diff --git a/nova/scheduler/utils.py b/nova/scheduler/utils.py
+index e1ea3f7acf..e5adb51829 100644
+--- a/nova/scheduler/utils.py
++++ b/nova/scheduler/utils.py
+@@ -153,7 +153,10 @@ class ResourceRequest(object):
+             self._add_resource(None, orc.VCPU, request_spec.vcpus)
+ 
+         if orc.MEMORY_MB not in merged_resources:
+-            self._add_resource(None, orc.MEMORY_MB, request_spec.memory_mb)
++            memory_mb = request_spec.memory_mb
++            self._add_resource(None, orc.MEMORY_MB, memory_mb)
++        else:
++            memory_mb = merged_resources[orc.MEMORY_MB]
+ 
+         if orc.DISK_GB not in merged_resources:
+             disk = request_spec.ephemeral_gb
+@@ -168,6 +171,8 @@ class ResourceRequest(object):
+ 
+         self._translate_vpmems_request(request_spec.flavor)
+ 
++        self._translate_memtier_request(request_spec.flavor, memory_mb)
++
+         self.strip_zeros()
+ 
+     def _process_requested_resources(self, request_spec):
+@@ -249,6 +254,18 @@ class ResourceRequest(object):
+             LOG.debug("Added resource %s=%d to requested resources",
+                       resource_class, amount)
+ 
++    def _translate_memtier_request(self, flavor, memory_mb):
++        memtier_trait = "trait:CUSTOM_MEMTIER"
++        if not flavor.extra_specs.get(memtier_trait):
++            # NOTE(luyao): Instance should be scheduled to host without
++            # memory tiering by default.
++            self._add_trait(None, "CUSTOM_MEMTIER", "forbidden")
++            return
++        memtier_top_limit = hardware.get_memtier_toplimit(flavor)
++        if memtier_top_limit == 0:
++            resource_class = orc.normalize_name("secondary_memory_mb")
++            self._add_resource(None, resource_class, memory_mb)
++
+     def _translate_pinning_policies(self, flavor, image):
+         """Translate the legacy pinning policies to resource requests."""
+         # NOTE(stephenfin): These can raise exceptions but these have already
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index 0253dd9927..a3e9f49767 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -1787,8 +1787,11 @@ def numa_get_constraints(flavor, image_meta):
+     nodes = _get_numa_node_count_constraint(flavor, image_meta)
+     pagesize = _get_numa_pagesize_constraint(flavor, image_meta)
+     vpmems = get_vpmems(flavor)
++    memtier_toplimit = get_memtier_toplimit(flavor)
+ 
+-    if nodes or pagesize or vpmems:
++    # if VM requests memory all located on second tier memory,
++    # it will needs memory node binding to support
++    if nodes or pagesize or vpmems or (memtier_toplimit == 0):
+         nodes = nodes or 1
+ 
+         cpu_list = _get_numa_cpu_constraint(flavor, image_meta)
+@@ -2260,3 +2263,17 @@ def check_hw_rescue_props(image_meta):
+     """
+     hw_rescue_props = ['hw_rescue_device', 'hw_rescue_bus']
+     return any(key in image_meta.properties for key in hw_rescue_props)
++
++
++def get_memtier_toplimit(flavor):
++    """Return toptier limit if the VM request memory tiering"""
++    extra_specs = flavor.get('extra_specs', {})
++    toptier_limit = extra_specs.get('hw:memtier.toptier_limit')
++    if toptier_limit:
++        # convert to kib unit
++        pattern = re.compile(r"(\d+)(GB|MB|KB|$)")
++        value, unit = pattern.match(toptier_limit).groups()
++        limit_kb = int(value) * (units.Mi if unit == "GB" else (
++                units.Ki if unit == "MB" else 1))
++        return int(limit_kb)
++    return -1
+diff --git a/nova/virt/libvirt/config.py b/nova/virt/libvirt/config.py
+index 23ecb2ccfd..b92e328d68 100644
+--- a/nova/virt/libvirt/config.py
++++ b/nova/virt/libvirt/config.py
+@@ -2436,6 +2436,7 @@ class LibvirtConfigGuestMemoryTune(LibvirtConfigObject):
+         self.hard_limit = None
+         self.soft_limit = None
+         self.swap_hard_limit = None
++        self.toptier_limit = None
+         self.min_guarantee = None
+ 
+     def format_dom(self):
+@@ -2453,6 +2454,10 @@ class LibvirtConfigGuestMemoryTune(LibvirtConfigObject):
+             root.append(self._text_node("swap_hard_limit",
+                                         str(self.swap_hard_limit),
+                                         unit="KiB"))
++        if self.toptier_limit is not None:
++            root.append(self._text_node("toptier_soft_limit",
++                                        str(self.toptier_limit),
++                                        unit="KiB"))
+         if self.min_guarantee is not None:
+             root.append(self._text_node("min_guarantee",
+                                         str(self.min_guarantee),
+diff --git a/nova/virt/libvirt/designer.py b/nova/virt/libvirt/designer.py
+index 7bafd47bbc..9d2395fb42 100644
+--- a/nova/virt/libvirt/designer.py
++++ b/nova/virt/libvirt/designer.py
+@@ -183,11 +183,11 @@ def set_vif_bandwidth_config(conf, inst_type):
+                 setattr(conf, scope[1], value)
+ 
+ 
+-def set_numa_memnode(conf, guest_node_id, host_cell_id):
++def set_numa_memnode(conf, guest_node_id, host_cell_ids):
+     """Prepares numa memory node config for the guest.
+     """
+     conf.cellid = guest_node_id
+-    conf.nodeset = [host_cell_id]
++    conf.nodeset = host_cell_ids
+     conf.mode = "strict"
+ 
+ 
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index bc832749ab..8d069f94f4 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -425,6 +425,9 @@ class LibvirtDriver(driver.ComputeDriver):
+         self.pgpu_type_mapping = collections.defaultdict(str)
+         self.supported_vgpu_types = self._get_supported_vgpu_types()
+ 
++        # memory tiering support: record memory node affinities
++        self.memory_affinities = {}
++
+     def _discover_vpmems(self, vpmem_conf=None):
+         """Discover vpmems on host and configuration.
+ 
+@@ -5011,6 +5014,15 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         return emulatorpin_cpuset
+ 
++    def _get_guest_memtune(self, flavor):
++        """Return config object of LibvirtConfigGuestMemoryTune"""
++        memtune = vconfig.LibvirtConfigGuestMemoryTune()
++        toplimit = hardware.get_memtier_toplimit(flavor)
++        if toplimit < 0:
++            return None
++        memtune.toptier_limit = toplimit
++        return memtune
++
+     def _get_guest_numa_config(self, instance_numa_topology, flavor,
+                                image_meta):
+         """Returns the config objects for the guest NUMA specs.
+@@ -5107,9 +5119,19 @@ class LibvirtDriver(driver.ComputeDriver):
+                 cell_pairs):
+             # set NUMATune for the cell
+             tnode = vconfig.LibvirtConfigGuestNUMATuneMemNode()
+-            designer.set_numa_memnode(tnode, guest_node_id, host_cell.id)
++            memtier_toplimit = hardware.get_memtier_toplimit(flavor)
++            if memtier_toplimit < 0:
++                designer.set_numa_memnode(tnode, guest_node_id, [host_cell.id])
++                guest_numa_tune.memory.nodeset.append(host_cell.id)
++            else:
++                second_tier = self.memory_affinities[host_cell.id]
++                guest_numa_tune.memory.nodeset.extend([host_cell.id, second_tier])
++                if memtier_toplimit == 0:
++                    designer.set_numa_memnode(tnode, guest_node_id, [second_tier])
++                else:
++                    designer.set_numa_memnode(tnode, guest_node_id,
++                                              [host_cell.id, second_tier])
+             guest_numa_tune.memnodes.append(tnode)
+-            guest_numa_tune.memory.nodeset.append(host_cell.id)
+ 
+             # set CPUTune for the cell
+             object_numa_cell = instance_numa_topology.cells[guest_node_id]
+@@ -5893,6 +5915,9 @@ class LibvirtDriver(driver.ComputeDriver):
+         guest.memory = flavor.memory_mb * units.Ki
+         guest.vcpus = flavor.vcpus
+ 
++        # We are using default unit for mmetune: KiB
++        guest.memtune = self._get_guest_memtune(flavor)
++
+         guest_numa_config = self._get_guest_numa_config(
+             instance.numa_topology, flavor, image_meta)
+ 
+@@ -7432,6 +7457,18 @@ class LibvirtDriver(driver.ComputeDriver):
+                 physnets=physnet_affinities[cell.id],
+                 tunneled=tunnel_affinities[cell.id])
+ 
++            # NOTE(luyao): Memory Tiering support
++            # Top tier and second tier are physically located together,
++            # try to get sencond tier if there is
++            second_tier = nova.privsep.libvirt.get_second_tier_memnode(
++                cell.id)
++            if second_tier > -1:
++                self.memory_affinities[cell.id] = second_tier
++                for second_tier_cell in topology.cells:
++                    if second_tier_cell.id == second_tier:
++                        cell.memory = cell.memory + second_tier_cell.memory
++                        break
++
+             # NOTE(stephenfin): Note that we don't actually return any usage
+             # information here. This is because this is handled by the resource
+             # tracker via the 'update_available_resource' periodic task, which
+-- 
+2.25.4
+

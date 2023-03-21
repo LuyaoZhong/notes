@@ -1,0 +1,387 @@
+From 3d255a4ef59f8c4001e7078976f77786bedfeb5d Mon Sep 17 00:00:00 2001
+From: Luyao Zhong <luyao.zhong@intel.com>
+Date: Thu, 9 Jul 2020 11:30:06 -0400
+Subject: [PATCH 2/3] advanced memtier support
+
+introduce a new option in libvirt group: memtier_enabled
+add support for second tier memory tracking
+---
+ nova/compute/resource_tracker.py | 20 +++++++++++++++++++-
+ nova/conf/libvirt.py             | 14 ++++++++++++++
+ nova/db/sqlalchemy/models.py     |  2 ++
+ nova/objects/compute_node.py     | 13 +++++++++++--
+ nova/objects/numa.py             | 12 +++++++++++-
+ nova/virt/hardware.py            | 11 ++++++++++-
+ nova/virt/libvirt/driver.py      | 26 +++++++++++++++++++++++++-
+ 7 files changed, 92 insertions(+), 6 deletions(-)
+
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 63496e7a0b..01b8a05d47 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -1001,6 +1001,8 @@ class ResourceTracker(object):
+                   "name=%(node)s "
+                   "phys_ram=%(phys_ram)sMB "
+                   "used_ram=%(used_ram)sMB "
++                  "phys_secondary_ram=%(phys_secondary_ram)sMB "
++                  "used_secondary_ram=%(used_secondary_ram)sMB"
+                   "phys_disk=%(phys_disk)sGB "
+                   "used_disk=%(used_disk)sGB "
+                   "total_vcpus=%(total_vcpus)s "
+@@ -1009,6 +1011,8 @@ class ResourceTracker(object):
+                   {'node': nodename,
+                    'phys_ram': cn.memory_mb,
+                    'used_ram': cn.memory_mb_used,
++                   'phys_secondary_ram': cn.secondary_memory_mb,
++                   'used_secondary_ram': cn.secondary_memory_mb_used,
+                    'phys_disk': cn.local_gb,
+                    'used_disk': cn.local_gb_used,
+                    'total_vcpus': tcpu,
+@@ -1185,11 +1189,13 @@ class ResourceTracker(object):
+         # removed or updated to use information from placement, we can think
+         # about dropping the fields from the 'ComputeNode' object entirely
+         mem_usage = usage['memory_mb']
++        secondary_mem_usage = usage['secondary_memory_mb']
+         disk_usage = usage.get('root_gb', 0)
+         vcpus_usage = usage.get('vcpus', 0)
+ 
+         cn = self.compute_nodes[nodename]
+         cn.memory_mb_used += sign * mem_usage
++        cn.secondary_memory_mb_used += sign * secondary_mem_usage
+         cn.local_gb_used += sign * disk_usage
+         cn.local_gb_used += sign * usage.get('ephemeral_gb', 0)
+         cn.local_gb_used += sign * usage.get('swap', 0) / 1024
+@@ -1212,10 +1218,14 @@ class ResourceTracker(object):
+                 cn.numa_topology)
+ 
+             free = sign == -1
++            # calculate secondary memory usage for per NUMA cell
++            # only when requiring pure secondary memory binding
++            membind2nd = False if secondary_mem_usage == 0 else True
+ 
+             # ...and reserialize once we save it back
+             cn.numa_topology = hardware.numa_usage_from_instance_numa(
+-                host_numa_topology, instance_numa_topology, free)._to_json()
++                host_numa_topology, instance_numa_topology,
++                free, membind2nd=membind2nd)._to_json()
+ 
+     def _get_migration_context_resource(self, resource, instance,
+                                         prefix='new_'):
+@@ -1684,12 +1694,20 @@ class ResourceTracker(object):
+                                  object_or_dict.flavor.root_gb),
+                      'ephemeral_gb': object_or_dict.flavor.ephemeral_gb,
+                      'numa_topology': object_or_dict.numa_topology}
++            flavor = object_or_dict.flavor
+         elif isinstance(object_or_dict, objects.Flavor):
+             usage = obj_base.obj_to_primitive(object_or_dict)
+             if _is_bfv():
+                 usage['root_gb'] = 0
++            flavor = object_or_dict
+         else:
+             usage.update(object_or_dict)
++            flavor = None
++
++        if flavor and hardware.get_memtier_toplimit(flavor) == 0:
++            usage['secondary_memory_mb'] = flavor.memory_mb
++        else:
++            usage['secondary_memory_mb'] = 0
+ 
+         for key in ('numa_topology',):
+             if key in updates:
+diff --git a/nova/conf/libvirt.py b/nova/conf/libvirt.py
+index 2568d65ba3..fcbd0d97a6 100644
+--- a/nova/conf/libvirt.py
++++ b/nova/conf/libvirt.py
+@@ -1383,6 +1383,19 @@ For example::
+ ]
+ 
+ 
++libvirt_memtier_opts = [
++  cfg.BoolOpt('memtier_enabled',
++              default=False,
++              help="""
++This option allows Nova to detect if memory tiering is enabled on host
++
++When enabled, Nova will attach a trait to the host via Placement, then
++the instances with memtier requests will be scheduled to those hosts with
++memory tiering enabled.
++""")
++]
++
++
+ ALL_OPTS = list(itertools.chain(
+     libvirt_general_opts,
+     libvirt_imagebackend_opts,
+@@ -1402,6 +1415,7 @@ ALL_OPTS = list(itertools.chain(
+     libvirt_virtio_queue_sizes,
+     libvirt_volume_nvmeof_opts,
+     libvirt_pmem_opts,
++    libvirt_memtier_opts,
+ ))
+ 
+ 
+diff --git a/nova/db/sqlalchemy/models.py b/nova/db/sqlalchemy/models.py
+index df2c67c6e2..a4e252de1c 100644
+--- a/nova/db/sqlalchemy/models.py
++++ b/nova/db/sqlalchemy/models.py
+@@ -129,9 +129,11 @@ class ComputeNode(BASE, NovaBase, models.SoftDeleteMixin):
+     uuid = Column(String(36), nullable=True)
+     vcpus = Column(Integer, nullable=False)
+     memory_mb = Column(Integer, nullable=False)
++    secondary_memory_mb = Column(Integer, nullable=False)
+     local_gb = Column(Integer, nullable=False)
+     vcpus_used = Column(Integer, nullable=False)
+     memory_mb_used = Column(Integer, nullable=False)
++    secondary_memory_mb_used = Column(Integer, nullable=False)
+     local_gb_used = Column(Integer, nullable=False)
+     hypervisor_type = Column(MediumText(), nullable=False)
+     hypervisor_version = Column(Integer, nullable=False)
+diff --git a/nova/objects/compute_node.py b/nova/objects/compute_node.py
+index cf5d3ca8d8..2018c0cc78 100644
+--- a/nova/objects/compute_node.py
++++ b/nova/objects/compute_node.py
+@@ -54,7 +54,8 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
+     # Version 1.17: Added mapped
+     # Version 1.18: Added get_by_uuid().
+     # Version 1.19: Added get_by_nodename().
+-    VERSION = '1.19'
++    # Version 1.20: Added secondary_memory_mb and secondary_memory_mb_used field.
++    VERSION = '1.20'
+ 
+     fields = {
+         'id': fields.IntegerField(read_only=True),
+@@ -63,9 +64,11 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
+         'host': fields.StringField(nullable=True),
+         'vcpus': fields.IntegerField(),
+         'memory_mb': fields.IntegerField(),
++        'secondary_memory_mb': fields.IntegerField(),
+         'local_gb': fields.IntegerField(),
+         'vcpus_used': fields.IntegerField(),
+         'memory_mb_used': fields.IntegerField(),
++        'secondary_memory_mb_used': fields.IntegerField(),
+         'local_gb_used': fields.IntegerField(),
+         'hypervisor_type': fields.StringField(),
+         'hypervisor_version': fields.IntegerField(),
+@@ -101,6 +104,11 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
+     def obj_make_compatible(self, primitive, target_version):
+         super(ComputeNode, self).obj_make_compatible(primitive, target_version)
+         target_version = versionutils.convert_version_to_tuple(target_version)
++        if target_version < (1, 20):
++            if 'secondary_memory_mb' in primitives:
++                del primitive['secondary_memory_mb']
++            if 'secondary_memory_mb_used' in primitive:
++                del primitive['secondary_memory_mb_used']
+         if target_version < (1, 17):
+             if 'mapped' in primitive:
+                 del primitive['mapped']
+@@ -371,7 +379,8 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
+                 "vcpus_used", "memory_mb_used", "local_gb_used",
+                 "numa_topology", "hypervisor_type",
+                 "hypervisor_version", "hypervisor_hostname",
+-                "disk_available_least", "host_ip", "uuid"]
++                "disk_available_least", "host_ip", "uuid",
++                "secondary_memory_mb", "secondary_memory_mb_used"]
+         for key in keys:
+             if key in resources:
+                 # The uuid field is read-only so it should only be set when
+diff --git a/nova/objects/numa.py b/nova/objects/numa.py
+index 98927880a0..27cfb83ea3 100644
+--- a/nova/objects/numa.py
++++ b/nova/objects/numa.py
+@@ -28,15 +28,18 @@ class NUMACell(base.NovaObject):
+     # Version 1.2: Added mempages field
+     # Version 1.3: Add network_metadata field
+     # Version 1.4: Add pcpuset
+-    VERSION = '1.4'
++    # Version 1.5: Add secondary_mem and secondary_memusage field
++    VERSION = '1.5'
+ 
+     fields = {
+         'id': obj_fields.IntegerField(read_only=True),
+         'cpuset': obj_fields.SetOfIntegersField(),
+         'pcpuset': obj_fields.SetOfIntegersField(),
+         'memory': obj_fields.IntegerField(),
++        'secondary_memory': obj_fields.IntegerField(default=0),
+         'cpu_usage': obj_fields.IntegerField(default=0),
+         'memory_usage': obj_fields.IntegerField(default=0),
++        'secondary_memory_usage': obj_fields.IntegerField(default=0),
+         'pinned_cpus': obj_fields.SetOfIntegersField(),
+         'siblings': obj_fields.ListOfSetsOfIntegersField(),
+         'mempages': obj_fields.ListOfObjectsField('NUMAPagesTopology'),
+@@ -46,6 +49,9 @@ class NUMACell(base.NovaObject):
+     def obj_make_compatible(self, primitive, target_version):
+         super(NUMACell, self).obj_make_compatible(primitive, target_version)
+         target_version = versionutils.convert_version_to_tuple(target_version)
++        if target_version < (1, 5):
++            primitive.pop('secondary_memory', None)
++            primitive.pop('secondary_memory_usage', None)
+         if target_version < (1, 4):
+             primitive.pop('pcpuset', None)
+         if target_version < (1, 3):
+@@ -76,6 +82,10 @@ class NUMACell(base.NovaObject):
+     def avail_memory(self):
+         return self.memory - self.memory_usage
+ 
++    @property
++    def avail_secondary_memory(self):
++        return self.secondary_memory - self.secondary_memory_usage
++
+     @property
+     def has_threads(self):
+         """Check if SMT threads, a.k.a. HyperThreads, are present."""
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index a3e9f49767..e31c277bea 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -2150,7 +2150,7 @@ def _numa_pagesize_usage_from_cell(host_cell, instance_cell, sign):
+ 
+ 
+ def numa_usage_from_instance_numa(host_topology, instance_topology,
+-                                  free=False):
++                                  free=False, membind2nd=False):
+     """Update the host topology usage.
+ 
+     Update the host NUMA topology based on usage by the provided instance NUMA
+@@ -2161,6 +2161,8 @@ def numa_usage_from_instance_numa(host_topology, instance_topology,
+         retrieve usage information.
+     :param free: If true, decrease, rather than increase, host usage based on
+         instance usage.
++    :param membind2nd: If this instance memory is bond to second tier memory
++        node
+ 
+     :returns: Updated objects.NUMATopology for host
+     """
+@@ -2172,6 +2174,7 @@ def numa_usage_from_instance_numa(host_topology, instance_topology,
+ 
+     for host_cell in host_topology.cells:
+         memory_usage = host_cell.memory_usage
++        secondary_memory_usage = host_cell.secondary_memory_usage
+         shared_cpus_usage = host_cell.cpu_usage
+ 
+         # The 'pcpuset' field is only set by newer compute nodes, so if it's
+@@ -2192,8 +2195,10 @@ def numa_usage_from_instance_numa(host_topology, instance_topology,
+             cpuset=shared_cpus,
+             pcpuset=dedicated_cpus,
+             memory=host_cell.memory,
++            secondary_memory=host_cell.secondary_memory,
+             cpu_usage=0,
+             memory_usage=0,
++            secondary_memory_usage=0,
+             mempages=host_cell.mempages,
+             pinned_cpus=host_cell.pinned_cpus,
+             siblings=host_cell.siblings)
+@@ -2209,6 +2214,9 @@ def numa_usage_from_instance_numa(host_topology, instance_topology,
+                 new_cell, instance_cell, sign)
+ 
+             memory_usage = memory_usage + sign * instance_cell.memory
++            if membind2nd:
++                secondary_memory_usage = (secondary_memory_usage +
++                    sign * instance_cell.memory)
+ 
+             if not instance_cell.cpu_pinning_requested:
+                 shared_cpus_usage += sign * len(instance_cell.cpuset)
+@@ -2234,6 +2242,7 @@ def numa_usage_from_instance_numa(host_topology, instance_topology,
+         # NOTE(stephenfin): We don't need to set 'pinned_cpus' here since that
+         # was done in the above '(un)pin_cpus(_with_siblings)' functions
+         new_cell.memory_usage = max(0, memory_usage)
++        new_cell.secondary_memory_usage = max(0, secondary_memory_usage)
+         new_cell.cpu_usage = max(0, shared_cpus_usage)
+         cells.append(new_cell)
+ 
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 8d069f94f4..a2de12f891 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -426,7 +426,9 @@ class LibvirtDriver(driver.ComputeDriver):
+         self.supported_vgpu_types = self._get_supported_vgpu_types()
+ 
+         # memory tiering support: record memory node affinities
++        # and second tier memory size
+         self.memory_affinities = {}
++        self.secondary_memory_mb = 0
+ 
+     def _discover_vpmems(self, vpmem_conf=None):
+         """Discover vpmems on host and configuration.
+@@ -7426,6 +7428,7 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         physnet_affinities = _get_physnet_numa_affinity()
+         tunnel_affinities = _get_tunnel_numa_affinity()
++        self.secondary_memory_mb = 0
+ 
+         for cell in topology.cells:
+             cpus = set(cpu.id for cpu in cell.cpus)
+@@ -7459,7 +7462,7 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+             # NOTE(luyao): Memory Tiering support
+             # Top tier and second tier are physically located together,
+-            # try to get sencond tier if there is
++            # try to get sencond tier if it exists
+             second_tier = nova.privsep.libvirt.get_second_tier_memnode(
+                 cell.id)
+             if second_tier > -1:
+@@ -7467,7 +7470,11 @@ class LibvirtDriver(driver.ComputeDriver):
+                 for second_tier_cell in topology.cells:
+                     if second_tier_cell.id == second_tier:
+                         cell.memory = cell.memory + second_tier_cell.memory
++                        secondary_memory = second_tier_cell.memory
+                         break
++            else:
++                secondary_memory = 0
++            self.secondary_memory_mb += secondary_memory / units.Ki
+ 
+             # NOTE(stephenfin): Note that we don't actually return any usage
+             # information here. This is because this is handled by the resource
+@@ -7478,9 +7485,11 @@ class LibvirtDriver(driver.ComputeDriver):
+                 cpuset=cpuset,
+                 pcpuset=pcpuset,
+                 memory=cell.memory / units.Ki,
++                secondary_memory=secondary_memory / units.Ki,
+                 cpu_usage=0,
+                 pinned_cpus=set(),
+                 memory_usage=0,
++                secondary_memory_usage=0,
+                 siblings=siblings,
+                 mempages=mempages,
+                 network_metadata=network_metadata)
+@@ -7621,6 +7630,16 @@ class LibvirtDriver(driver.ComputeDriver):
+             },
+         }
+ 
++        if self.secondary_memory_mb:
++            result[orc.normalize_name("secondary_memory_mb")] = {
++                'total': self.secondary_memory_mb,
++                'min_unit': 1,
++                'max_unit': self.secondary_memory_mb,
++                'step_size': 1,
++                'allocation_ratio': 1,
++                'reserved': 0,
++            }
++
+         # NOTE(stephenfin): We have to optionally report these since placement
+         # forbids reporting inventory with total=0
+         if vcpus:
+@@ -7691,6 +7710,8 @@ class LibvirtDriver(driver.ComputeDriver):
+             t for t in self.static_traits if self.static_traits[t]
+         ]
+         traits_to_remove = set(self.static_traits) - set(traits_to_add)
++        if CONF.libvirt.memtier_enabled:
++            traits_to_add.append(ot.normalize_name("memtier"))
+         provider_tree.add_traits(nodename, *traits_to_add)
+         provider_tree.remove_traits(nodename, *traits_to_remove)
+ 
+@@ -8266,9 +8287,12 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         data["vcpus"] = len(self._get_vcpu_available())
+         data["memory_mb"] = self._host.get_memory_mb_total()
++        data["secondary_memory_mb"] = self.secondary_memory_mb
+         data["local_gb"] = disk_info_dict['total']
+         data["vcpus_used"] = self._get_vcpu_used()
+         data["memory_mb_used"] = self._host.get_memory_mb_used()
++        # second tier memory usage report is not supported in hypervisor yet
++        data["secondary_memory_mb_used"] = 0
+         data["local_gb_used"] = disk_info_dict['used']
+         data["hypervisor_type"] = self._host.get_driver_type()
+         data["hypervisor_version"] = self._host.get_version()
+-- 
+2.25.4
+
