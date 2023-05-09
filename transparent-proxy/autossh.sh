@@ -1,0 +1,1 @@
+/usr/bin/autossh -f -M 0 -N -L 127.0.0.1:1080:$TARGET_IP:$TARGET_PORT $JUMP_MACHINE
